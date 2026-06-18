@@ -28,6 +28,51 @@ async function run() {
     const usersCollection = db.collection('users');
     const bookingsCollection = db.collection('bookings');
 
+    const bcrypt = require('bcryptjs');
+
+    app.post('/register', async (req, res) => {
+      try {
+        const { name, email, password, role } = req.body;
+
+        const existingUser = await usersCollection.findOne({ email });
+        if (existingUser) {
+          return res
+            .status(400)
+            .send({ message: 'Email is already registered!' });
+        }
+
+        const salt = await bcrypt.genSalt(10);
+        const hashedPassword = await bcrypt.hash(password, salt);
+
+        const newUser = {
+          name,
+          email,
+          password: hashedPassword,
+          role: role || 'user',
+          createdAt: new Date(),
+        };
+
+        const result = await usersCollection.insertOne(newUser);
+        res.status(201).send({
+          success: true,
+          message: 'User registered successfully!',
+          insertId: result.insertedId,
+        });
+      } catch (error) {
+        res.status(500).send({
+          message: 'Internal server error during registration',
+          error,
+        });
+      }
+    });
+
+
+
+
+
+
+
+
     app.get('/', (req, res) => {
       res.send('TicketBari Server is running smoothly...');
     });
