@@ -66,12 +66,54 @@ async function run() {
       }
     });
 
+    const jwt = require('jsonwebtoken');
 
+    app.post('/login', async (req, res) => {
+      try {
+        const { email, password } = req.body;
 
+        const user = await usersCollection.findOne({ email });
+        if (!user) {
+          return res
+            .status(404)
+            .send({ message: 'User not found! Please register first.' });
+        }
 
+        const isPasswordMatch = await bcrypt.compare(password, user.password);
+        if (!isPasswordMatch) {
+          return res
+            .status(401)
+            .send({ message: 'Invalid email or password!' });
+        }
 
+        const tokenPayload = {
+          uid: user._id,
+          email: user.email,
+          role: user.role,
+        };
 
+        const token = jwt.sign(tokenPayload, process.env.JWT_SECRET, {
+          expiresIn: '7d',
+        });
 
+        res.status(200).send({
+          success: true,
+          message: 'Login successful!',
+          token,
+          user: {
+            name: user.name,
+            email: user.email,
+            role: user.role,
+          },
+        });
+      } catch (error) {
+        res
+          .status(500)
+          .send({ message: 'Internal server error during login', error });
+      }
+    });
+
+    //end
 
     app.get('/', (req, res) => {
       res.send('TicketBari Server is running smoothly...');
