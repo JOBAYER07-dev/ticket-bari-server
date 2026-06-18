@@ -18,6 +18,28 @@ const client = new MongoClient(uri, {
   },
 });
 
+const jwt = require('jsonwebtoken');
+
+function verifyJWT(req, res, next) {
+  const authHeader = req.headers.authorization;
+  if (!authHeader) {
+    return res
+      .status(401)
+      .send({ message: 'Unauthorized access! Missing token.' });
+  }
+
+  const token = authHeader.split(' ')[1];
+  jwt.verify(token, process.env.JWT_SECRET, (err, decoded) => {
+    if (err) {
+      return res
+        .status(403)
+        .send({ message: 'Forbidden access! Invalid token.' });
+    }
+    req.decoded = decoded;
+    next();
+  });
+}
+
 async function run() {
   try {
     await client.connect();
@@ -30,7 +52,7 @@ async function run() {
 
     const bcrypt = require('bcryptjs');
 
-    app.post('/register', async (req, res) => {
+    post('/register', async (req, res) => {
       try {
         const { name, email, password, role } = req.body;
 
@@ -65,8 +87,6 @@ async function run() {
         });
       }
     });
-
-    const jwt = require('jsonwebtoken');
 
     app.post('/login', async (req, res) => {
       try {
@@ -171,6 +191,29 @@ async function run() {
         res
           .status(500)
           .send({ message: 'Error fetching ticket details', error });
+      }
+    });
+
+    app.post('/bookings', verifyJWT, async (req, res) => {
+      try {
+        const bookingData = req.body;
+
+        if (req.decoded.email !== bookingData.userEmail) {
+          return res
+            .status(403)
+            .send({ message: 'Forbidden access! Token mismatch.' });
+        }
+
+        bookingData.createdAt = new Date();
+        const result = await bookingsCollection.insertOne(bookingData);
+
+        res.status(201).send({
+          success: true,
+          message: 'Ticket booked successfully!',
+          bookingId: result.insertedId,
+        });
+      } catch (error) {
+        res.status(500).send({ message: 'Error processing booking', error });
       }
     });
   } finally {
