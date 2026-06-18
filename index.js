@@ -3,6 +3,10 @@ const cors = require('cors');
 const { MongoClient, ServerApiVersion, ObjectId } = require('mongodb');
 require('dotenv').config();
 
+const stripe = require('stripe')(
+  process.env.STRIPE_SECRET_KEY || 'sk_test_mock_secret_key_ticket_bari',
+);
+
 const app = express();
 const port = process.env.PORT || 5000;
 
@@ -45,12 +49,11 @@ async function run() {
     const ticketsCollection = db.collection('tickets');
     const usersCollection = db.collection('users');
     const bookingsCollection = db.collection('bookings');
+    const transactionsCollection = db.collection('transactions');
 
     const bcrypt = require('bcryptjs');
 
-    // ------------------------------------------------------------------------
-    // Role Verification Middlewares
-    // ------------------------------------------------------------------------
+    // Role Verification Middleware
     const verifyAdmin = async (req, res, next) => {
       const requesterAccount = await usersCollection.findOne({
         email: req.decoded.email,
@@ -64,8 +67,53 @@ async function run() {
     };
 
     // ------------------------------------------------------------------------
-    // AUTHENTICATION ENDPOINTS
+    // BETTERAUTH & SOCIAL LOGIN ENDPOINTS (Requirement 2)
     // ------------------------------------------------------------------------
+    app.post('/auth/social-sync', async (req, res) => {
+      try {
+        const { name, email, photoURL } = req.body;
+
+        let user = await usersCollection.findOne({ email });
+
+        if (!user) {
+          const newUser = {
+            name,
+            email,
+            role: 'user',
+            isFraud: false,
+            photoURL: photoURL || '',
+            createdAt: new Date(),
+          };
+          const result = await usersCollection.insertOne(newUser);
+          user = { ...newUser, _id: result.insertedId };
+        }
+
+        if (user.isFraud) {
+          return res.status(403).send({
+            message: 'Access Denied! This profile has been flagged as fraud.',
+          });
+        }
+
+        const token = jwt.sign(
+          { email: user.email, role: user.role },
+          process.env.JWT_SECRET,
+          { expiresIn: '7d' },
+        );
+
+        res.send({
+          success: true,
+          token,
+          user: { name: user.name, email: user.email, role: user.role },
+        });
+      } catch (error) {
+        res.status(500).send({
+          message: 'BetterAuth social token synchronization failed.',
+          error,
+        });
+      }
+    });
+
+    // Traditional Native Authentication Endpoints
     app.post('/register', async (req, res) => {
       try {
         const { name, email, password, role } = req.body;
@@ -81,7 +129,7 @@ async function run() {
           email,
           password: hashedPassword,
           role: role || 'user',
-          isFraud: false, // Core requirement 8c
+          isFraud: false,
           createdAt: new Date(),
         };
 
@@ -97,6 +145,10 @@ async function run() {
         const { email, password } = req.body;
         const user = await usersCollection.findOne({ email });
         if (!user) return res.status(404).send({ message: 'User not found!' });
+        if (user.isFraud)
+          return res.status(403).send({
+            message: 'Access Denied! This profile has been flagged as fraud.',
+          });
 
         const isMatch = await bcrypt.compare(password, user.password);
         if (!isMatch)
@@ -118,16 +170,128 @@ async function run() {
     });
 
     // ------------------------------------------------------------------------
-    // TICKETS OPERATIONS (USER, VENDOR, ADMIN)
+    // STRIPE PAYMENT OPERATIONS & SEAT REDUCTION CORRECTION
     // ------------------------------------------------------------------------
+    app.post('/create-payment-intent', verifyJWT, async (req, res) => {
+      try {
+        const { price } = req.body;
+        if (!price || isNaN(price)) {
+          return res
+            .status(400)
+            .send({ message: 'Invalid tokenized amount parameters.' });
+        }
+        const amount = Math.round(Number(price) * 100);
 
-    // Get Tickets with Filters, Sort, and Paginated Parameters
+        const paymentIntent = await stripe.paymentIntents.create({
+          amount: amount,
+          currency: 'bdt',
+          payment_method_types: ['card'],
+        });
+
+        res.send({ clientSecret: paymentIntent.client_secret });
+      } catch (error) {
+        res.status(500).send({
+          message: 'Stripe context integration crash.',
+          error: error.message,
+        });
+      }
+    });
+
+    app.post('/payments/confirm', verifyJWT, async (req, res) => {
+      try {
+        const {
+          bookingId,
+          transactionId,
+          ticketId,
+          finalPrice,
+          ticketTitle,
+          userEmail,
+          quantity, // 🎯 FETCHED: Reading user selected reservation seats metric dynamically
+        } = req.body;
+
+        const transactionRecord = {
+          transactionId,
+          amount: finalPrice,
+          ticketTitle: ticketTitle || 'Express Fleet Access Ticket',
+          paymentDate: new Date(),
+          userEmail,
+        };
+        await transactionsCollection.insertOne(transactionRecord);
+
+        await bookingsCollection.updateOne(
+          { _id: new ObjectId(bookingId) },
+          { $set: { status: 'paid' } },
+        );
+
+        const query = ObjectId.isValid(ticketId)
+          ? { _id: new ObjectId(ticketId) }
+          : { id: Number(ticketId) };
+
+        // 🎯 FIXED BUG: Reduce the dynamic quantities requested by user rather than fixed -1 limit
+        const seatsToReduce = quantity ? -Math.abs(Number(quantity)) : -1;
+        await ticketsCollection.updateOne(query, {
+          $inc: { seats: seatsToReduce },
+        });
+
+        res.send({ success: true, message: 'Transaction logs settled.' });
+      } catch (error) {
+        res.status(500).send({
+          message: 'Failed to synchronize transaction blocks.',
+          error,
+        });
+      }
+    });
+
+    app.get('/transactions', verifyJWT, async (req, res) => {
+      const { email } = req.query;
+      let query = {};
+      if (email) query.userEmail = email;
+      const result = await transactionsCollection
+        .find(query)
+        .sort({ paymentDate: -1 })
+        .toArray();
+      res.send(result);
+    });
+
+    // ------------------------------------------------------------------------
+    // TICKETS OPERATIONS
+    // ------------------------------------------------------------------------
+    app.get('/tickets/advertised', async (req, res) => {
+      try {
+        const query = {
+          isAdvertised: true,
+          verificationStatus: 'approved',
+          isHidden: { $ne: true },
+        };
+        const result = await ticketsCollection.find(query).limit(6).toArray();
+        res.send(result);
+      } catch (error) {
+        res
+          .status(500)
+          .send({ message: 'Error loading advertisements', error });
+      }
+    });
+
+    app.get('/tickets/latest', async (req, res) => {
+      try {
+        const query = {
+          verificationStatus: 'approved',
+          isHidden: { $ne: true },
+        };
+        const result = await ticketsCollection
+          .find(query)
+          .sort({ _id: -1 })
+          .limit(8)
+          .toArray();
+        res.send(result);
+      } catch (error) {
+        res.status(500).send({ message: 'Error loading feed', error });
+      }
+    });
+
     app.get('/tickets', async (req, res) => {
       try {
         const { from, to, type, sortBy, page = 1, limit = 6 } = req.query;
-
-        // Dynamic search query constraint
-        // Requirement 4 & 8c: Only show admin-approved tickets AND filter out fraud vendors
         let query = { verificationStatus: 'approved', isHidden: { $ne: true } };
 
         if (from) query.from = { $regex: from, $options: 'i' };
@@ -138,23 +302,23 @@ async function run() {
         if (sortBy === 'Price: Low to High') sortOptions.price = 1;
         else if (sortBy === 'Price: High to Low') sortOptions.price = -1;
 
-        // Challenge Requirement 4: Pagination Implementation
         const skip = (Number(page) - 1) * Number(limit);
-        const cursor = ticketsCollection
+        const result = await ticketsCollection
           .find(query)
           .sort(sortOptions)
           .skip(skip)
-          .limit(Number(limit));
-        const result = await cursor.toArray();
+          .limit(Number(limit))
+          .toArray();
         const total = await ticketsCollection.countDocuments(query);
 
         res.send({ tickets: result, total, pages: Math.ceil(total / limit) });
       } catch (error) {
-        res.status(500).send({ message: 'Error fetching tickets', error });
+        res
+          .status(500)
+          .send({ message: 'Error fetching ticket inventory', error });
       }
     });
 
-    // Dynamic Single Ticket Details Dynamic API
     app.get('/tickets/:id', async (req, res) => {
       try {
         const id = req.params.id;
@@ -166,11 +330,10 @@ async function run() {
       } catch (error) {
         res
           .status(500)
-          .send({ message: 'Error fetching ticket details', error });
+          .send({ message: 'Error loading ticket metrics', error });
       }
     });
 
-    // Vendor Adds New Ticket (Initially Pending Verification Status)
     app.post('/tickets', verifyJWT, async (req, res) => {
       try {
         const ticketData = req.body;
@@ -178,7 +341,7 @@ async function run() {
           ...ticketData,
           price: Number(ticketData.price),
           seats: Number(ticketData.seats),
-          verificationStatus: 'pending', // Requirement 7b
+          verificationStatus: 'pending',
           isAdvertised: false,
           createdAt: new Date(),
         };
@@ -187,15 +350,13 @@ async function run() {
       } catch (error) {
         res
           .status(500)
-          .send({ message: 'Error processing vendor listing', error });
+          .send({ message: 'Error processing vendor item creation', error });
       }
     });
 
     // ------------------------------------------------------------------------
-    // CORE ADMIN CONSOLE ACTIONS (Requirement 8)
+    // ADMIN ACTIONS WITH STRICT GATEKEEPING
     // ------------------------------------------------------------------------
-
-    // Get All App Users
     app.get('/users', verifyJWT, verifyAdmin, async (req, res) => {
       const result = await usersCollection
         .find({}, { projection: { password: 0 } })
@@ -203,7 +364,6 @@ async function run() {
       res.send(result);
     });
 
-    // Admin Changes Role (Make Admin / Make Vendor)
     app.patch('/users/role/:id', verifyJWT, verifyAdmin, async (req, res) => {
       const id = req.params.id;
       const { role } = req.body;
@@ -214,24 +374,18 @@ async function run() {
       res.send(result);
     });
 
-    // Admin Marks Vendor as Fraud (Requirement 8c)
     app.patch('/users/fraud/:id', verifyJWT, verifyAdmin, async (req, res) => {
       try {
         const id = req.params.id;
         const vendor = await usersCollection.findOne({ _id: new ObjectId(id) });
-
-        // 1. Mark vendor profile as fraud
         await usersCollection.updateOne(
           { _id: new ObjectId(id) },
           { $set: { isFraud: true } },
         );
-
-        // 2. Hide all existing tickets published by this specific fraud vendor email
         await ticketsCollection.updateMany(
           { vendorEmail: vendor.email },
           { $set: { isHidden: true } },
         );
-
         res.send({
           success: true,
           message: 'Vendor flagged as fraud and fleets hidden.',
@@ -239,18 +393,17 @@ async function run() {
       } catch (error) {
         res
           .status(500)
-          .send({ message: 'Fraud transaction processing aborted', error });
+          .send({ message: 'Fraud operation processing error.', error });
       }
     });
 
-    // Admin Approves/Rejects Vendor Ticket (Requirement 8b)
     app.patch(
       '/tickets/status/:id',
       verifyJWT,
       verifyAdmin,
       async (req, res) => {
         const id = req.params.id;
-        const { status } = req.body; // status can be 'approved' or 'rejected'
+        const { status } = req.body;
         const result = await ticketsCollection.updateOne(
           { _id: new ObjectId(id) },
           { $set: { verificationStatus: status } },
@@ -259,26 +412,23 @@ async function run() {
       },
     );
 
-    // Admin Toggles Advertisement State (Requirement 8d)
     app.patch(
       '/tickets/advertise/:id',
       verifyJWT,
       verifyAdmin,
       async (req, res) => {
         const id = req.params.id;
-        const { advertiseState } = req.body; // true or false
+        const { advertiseState } = req.body;
 
         if (advertiseState === true) {
           const activeAdsCount = await ticketsCollection.countDocuments({
             isAdvertised: true,
           });
           if (activeAdsCount >= 6) {
-            return res
-              .status(400)
-              .send({
-                message:
-                  'Maximum limit reached! Admin cannot advertise more than 6 tickets at a time.',
-              });
+            return res.status(400).send({
+              message:
+                'Maximum limit reached! Admin cannot advertise more than 6 tickets at a time.',
+            });
           }
         }
 
@@ -291,20 +441,14 @@ async function run() {
     );
 
     // ------------------------------------------------------------------------
-    // BOOKING OPERATIONS
+    // SECURED BOOKING OPERATIONS
     // ------------------------------------------------------------------------
     app.post('/bookings', verifyJWT, async (req, res) => {
       try {
         const bookingData = req.body;
         bookingData.createdAt = new Date();
         const result = await bookingsCollection.insertOne(bookingData);
-        res
-          .status(201)
-          .send({
-            success: true,
-            message: 'Saved with Pending status',
-            insertId: result.insertedId,
-          });
+        res.status(201).send({ success: true, insertId: result.insertedId });
       } catch (error) {
         res.status(500).send({ message: 'Booking processing error', error });
       }
@@ -312,8 +456,21 @@ async function run() {
 
     app.get('/bookings', verifyJWT, async (req, res) => {
       const email = req.query.email;
+      const userRole = req.decoded.role;
+
       let query = {};
-      if (email) query.userEmail = email; // If email is passed, filter for user. If empty, master log for admin.
+
+      // 🎯 SECURED: Allow Global bookings stream view only to Admin panel contexts
+      if (userRole !== 'admin') {
+        if (email && email === req.decoded.email) {
+          query.userEmail = email;
+        } else {
+          query.userEmail = req.decoded.email; // Fallback context layer protection
+        }
+      } else if (email) {
+        query.userEmail = email;
+      }
+
       const result = await bookingsCollection.find(query).toArray();
       res.send(result);
     });
@@ -326,7 +483,7 @@ async function run() {
       res.send(result);
     });
   } finally {
-    // Keep alive connection pool
+    // Connection persistent block
   }
 }
 run().catch(console.dir);
