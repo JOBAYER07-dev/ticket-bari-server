@@ -113,19 +113,64 @@ async function run() {
       }
     });
 
-    //end
-
     app.get('/', (req, res) => {
       res.send('TicketBari Server is running smoothly...');
     });
 
     app.get('/tickets', async (req, res) => {
       try {
-        const cursor = ticketsCollection.find({});
+        const { from, to, type, sortBy } = req.query;
+        let query = {};
+
+        if (from) {
+          query.from = { $regex: from, $options: 'i' };
+        }
+
+        if (to) {
+          query.to = { $regex: to, $options: 'i' };
+        }
+
+        if (type && type !== 'All Types') {
+          query.type = type;
+        }
+
+        let sortOptions = {};
+        if (sortBy === 'Price: Low to High') {
+          sortOptions.price = 1;
+        } else if (sortBy === 'Price: High to Low') {
+          sortOptions.price = -1;
+        }
+
+        const cursor = ticketsCollection.find(query).sort(sortOptions);
         const result = await cursor.toArray();
         res.send(result);
       } catch (error) {
         res.status(500).send({ message: 'Error fetching tickets', error });
+      }
+    });
+
+    app.get('/tickets/:id', async (req, res) => {
+      try {
+        const id = req.params.id;
+
+        let query;
+        if (ObjectId.isValid(id)) {
+          query = { _id: new ObjectId(id) };
+        } else {
+          query = { id: Number(id) };
+        }
+
+        const result = await ticketsCollection.findOne(query);
+
+        if (!result) {
+          return res.status(404).send({ message: 'Ticket not found!' });
+        }
+
+        res.send(result);
+      } catch (error) {
+        res
+          .status(500)
+          .send({ message: 'Error fetching ticket details', error });
       }
     });
   } finally {
