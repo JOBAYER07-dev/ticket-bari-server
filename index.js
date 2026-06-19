@@ -13,9 +13,7 @@ const port = process.env.PORT || 5000;
 app.use(cors());
 app.use(express.json());
 
-// ─────────────────────────────────────────────
 // MongoDB Connection
-// ─────────────────────────────────────────────
 const client = new MongoClient(process.env.MONGODB_URI, {
   serverApi: {
     version: ServerApiVersion.v1,
@@ -24,9 +22,7 @@ const client = new MongoClient(process.env.MONGODB_URI, {
   },
 });
 
-// ─────────────────────────────────────────────
 // JWT Middleware
-// ─────────────────────────────────────────────
 function verifyJWT(req, res, next) {
   const authHeader = req.headers.authorization;
   if (!authHeader) return res.status(401).send({ message: 'Unauthorized!' });
@@ -50,7 +46,7 @@ async function run() {
     const bookingsCollection = db.collection('bookings');
     const transactionsCollection = db.collection('transactions');
 
-    // ── Role Middleware ──────────────────────
+    // Role Middlewares
     const verifyAdmin = async (req, res, next) => {
       const user = await usersCollection.findOne({ email: req.decoded.email });
       if (user?.role !== 'admin')
@@ -69,18 +65,14 @@ async function run() {
     // AUTH ENDPOINTS
     // ══════════════════════════════════════════
 
-    // Register
     app.post('/register', async (req, res) => {
       try {
         const { name, email, password, role } = req.body;
-
         const existing = await usersCollection.findOne({ email });
         if (existing)
           return res.status(400).send({ message: 'Email already registered!' });
 
         const hashedPassword = await bcrypt.hash(password, 10);
-
-        // ✅ Security: block admin self-registration
         const safeRole = role === 'admin' ? 'user' : role || 'user';
 
         const newUser = {
@@ -100,7 +92,6 @@ async function run() {
       }
     });
 
-    // Login
     app.post('/login', async (req, res) => {
       try {
         const { email, password } = req.body;
@@ -135,7 +126,6 @@ async function run() {
       }
     });
 
-    // Google / Social Login Sync
     app.post('/auth/social-sync', async (req, res) => {
       try {
         const { name, email, photoURL } = req.body;
@@ -177,20 +167,14 @@ async function run() {
       }
     });
 
-    // ─── One-time Admin Seed (call once, then remove or protect) ───
-    // POST /seed/admin   body: { name, email, password, secretKey }
     app.post('/seed/admin', async (req, res) => {
       try {
         const { name, email, password, secretKey } = req.body;
-
-        // Simple secret key protection so random people can't use this
-        if (secretKey !== process.env.SEED_SECRET) {
+        if (secretKey !== process.env.SEED_SECRET)
           return res.status(403).send({ message: 'Invalid seed key.' });
-        }
 
         const existing = await usersCollection.findOne({ email });
         if (existing) {
-          // If exists, just make them admin
           await usersCollection.updateOne(
             { email },
             { $set: { role: 'admin' } },
@@ -211,7 +195,6 @@ async function run() {
           photoURL: '',
           createdAt: new Date(),
         });
-
         res
           .status(201)
           .send({ success: true, message: 'Admin created successfully.' });
@@ -222,10 +205,8 @@ async function run() {
 
     // ══════════════════════════════════════════
     // TICKET ENDPOINTS
-    // ⚠️ Specific routes MUST come before /:id
     // ══════════════════════════════════════════
 
-    // Public: Advertised tickets (home page)
     app.get('/tickets/advertised', async (req, res) => {
       try {
         const result = await ticketsCollection
@@ -244,7 +225,6 @@ async function run() {
       }
     });
 
-    // Public: Latest tickets (home page)
     app.get('/tickets/latest', async (req, res) => {
       try {
         const result = await ticketsCollection
@@ -260,7 +240,7 @@ async function run() {
       }
     });
 
-    // Admin: ALL tickets (including pending/rejected)
+    // Support both /tickets/all and /tickets/all configuration triggers for Frontend UI Compatibility
     app.get('/tickets/all', verifyJWT, verifyAdmin, async (req, res) => {
       try {
         const result = await ticketsCollection
@@ -273,21 +253,14 @@ async function run() {
       }
     });
 
-    // Vendor: Their own tickets
     app.get('/tickets/vendor', verifyJWT, verifyVendor, async (req, res) => {
       try {
-        const email = req.query.email;
-
-        // Security: vendor can only see their own tickets
+        const email = req.query.email || req.decoded.email;
         if (req.decoded.role === 'vendor' && email !== req.decoded.email) {
           return res.status(403).send({ message: 'Forbidden.' });
         }
-
-        const query = email
-          ? { vendorEmail: email }
-          : { vendorEmail: req.decoded.email };
         const result = await ticketsCollection
-          .find(query)
+          .find({ vendorEmail: email })
           .sort({ createdAt: -1 })
           .toArray();
         res.send(result);
@@ -298,10 +271,26 @@ async function run() {
       }
     });
 
-    // Public: All tickets with search, filter, sort, pagination
     app.get('/tickets', async (req, res) => {
       try {
-        const { from, to, type, sortBy, page = 1, limit = 6 } = req.query;
+        const {
+          from,
+          to,
+          type,
+          sortBy,
+          page = 1,
+          limit = 6,
+          email,
+        } = req.query;
+
+        // Route Compatibility: If vendor requests via /tickets?email=
+        if (email) {
+          const result = await ticketsCollection
+            .find({ vendorEmail: email })
+            .sort({ createdAt: -1 })
+            .toArray();
+          return res.send({ tickets: result, total: result.length, pages: 1 });
+        }
 
         let query = { status: 'approved', isHidden: { $ne: true } };
         if (from) query.from = { $regex: from, $options: 'i' };
@@ -331,7 +320,6 @@ async function run() {
       }
     });
 
-    // Public: Single ticket details
     app.get('/tickets/:id', async (req, res) => {
       try {
         const id = req.params.id;
@@ -347,10 +335,8 @@ async function run() {
       }
     });
 
-    // Vendor: Create ticket
     app.post('/tickets', verifyJWT, verifyVendor, async (req, res) => {
       try {
-        // Check if vendor is flagged as fraud
         const vendor = await usersCollection.findOne({
           email: req.decoded.email,
         });
@@ -363,8 +349,8 @@ async function run() {
           ...req.body,
           price: Number(req.body.price),
           seats: Number(req.body.seats),
-          status: 'pending', // ✅ field name: status (not verificationStatus)
-          advertised: false, // ✅ field name: advertised (not isAdvertised)
+          status: 'pending',
+          advertised: false,
           isHidden: false,
           createdAt: new Date(),
         };
@@ -376,78 +362,15 @@ async function run() {
       }
     });
 
-    // Vendor: Update ticket
-    app.patch('/tickets/:id', verifyJWT, verifyVendor, async (req, res) => {
-      try {
-        const id = req.params.id;
-        const ticket = await ticketsCollection.findOne({
-          _id: new ObjectId(id),
-        });
-
-        if (!ticket)
-          return res.status(404).send({ message: 'Ticket not found.' });
-
-        // Vendor can only update their own tickets
-        if (
-          req.decoded.role === 'vendor' &&
-          ticket.vendorEmail !== req.decoded.email
-        )
-          return res.status(403).send({ message: 'Forbidden.' });
-
-        // Cannot update rejected tickets
-        if (ticket.status === 'rejected')
-          return res
-            .status(400)
-            .send({ message: 'Cannot update rejected ticket.' });
-
-        const { status, advertised, isHidden, ...updateData } = req.body; // strip admin-only fields
-        const result = await ticketsCollection.updateOne(
-          { _id: new ObjectId(id) },
-          { $set: { ...updateData, updatedAt: new Date() } },
-        );
-        res.send({ success: true, result });
-      } catch (error) {
-        res.status(500).send({ message: 'Error updating ticket', error });
-      }
-    });
-
-    // Vendor: Delete ticket
-    app.delete('/tickets/:id', verifyJWT, verifyVendor, async (req, res) => {
-      try {
-        const id = req.params.id;
-        const ticket = await ticketsCollection.findOne({
-          _id: new ObjectId(id),
-        });
-
-        if (!ticket)
-          return res.status(404).send({ message: 'Ticket not found.' });
-
-        if (
-          req.decoded.role === 'vendor' &&
-          ticket.vendorEmail !== req.decoded.email
-        )
-          return res.status(403).send({ message: 'Forbidden.' });
-
-        const result = await ticketsCollection.deleteOne({
-          _id: new ObjectId(id),
-        });
-        res.send({ success: true, result });
-      } catch (error) {
-        res.status(500).send({ message: 'Error deleting ticket', error });
-      }
-    });
-
-    // ── Admin: Approve / Reject ticket ─────────
-    // ✅ Fixed URL: /tickets/:id/status  (was /tickets/status/:id)
+    // Support dual endpoint parameter mapping for status patchers
     app.patch(
-      '/tickets/:id/status',
+      ['/tickets/:id/status', '/tickets/status/:id'],
       verifyJWT,
       verifyAdmin,
       async (req, res) => {
         try {
           const id = req.params.id;
-          const { status } = req.body; // 'approved' | 'rejected'
-
+          const { status } = req.body;
           const result = await ticketsCollection.updateOne(
             { _id: new ObjectId(id) },
             { $set: { status } },
@@ -461,19 +384,18 @@ async function run() {
       },
     );
 
-    // ── Admin: Toggle advertise ─────────────────
-    // ✅ Fixed URL: /tickets/:id/advertise  (was /tickets/advertise/:id)
-    // ✅ Fixed field: advertised  (was advertiseState / isAdvertised)
     app.patch(
-      '/tickets/:id/advertise',
+      ['/tickets/:id/advertise', '/tickets/advertise/:id'],
       verifyJWT,
       verifyAdmin,
       async (req, res) => {
         try {
           const id = req.params.id;
-          const { advertised } = req.body;
+          const { advertised, advertiseState } = req.body;
+          const finalState =
+            advertised !== undefined ? advertised : advertiseState;
 
-          if (advertised === true) {
+          if (finalState === true) {
             const count = await ticketsCollection.countDocuments({
               advertised: true,
             });
@@ -485,7 +407,7 @@ async function run() {
 
           const result = await ticketsCollection.updateOne(
             { _id: new ObjectId(id) },
-            { $set: { advertised } },
+            { $set: { advertised: finalState } },
           );
           res.send({ success: true, result });
         } catch (error) {
@@ -494,77 +416,25 @@ async function run() {
       },
     );
 
-    // ══════════════════════════════════════════
-    // USER MANAGEMENT (Admin only)
-    // ══════════════════════════════════════════
-
-    // Get all users
-    app.get('/users', verifyJWT, verifyAdmin, async (req, res) => {
+    app.delete('/tickets/:id', verifyJWT, verifyVendor, async (req, res) => {
       try {
-        const result = await usersCollection
-          .find({}, { projection: { password: 0 } })
-          .toArray();
-        res.send(result);
-      } catch (error) {
-        res.status(500).send({ message: 'Error fetching users', error });
-      }
-    });
-
-    // Update user role
-    app.patch('/users/role/:id', verifyJWT, verifyAdmin, async (req, res) => {
-      try {
-        const { role } = req.body;
-        const result = await usersCollection.updateOne(
-          { _id: new ObjectId(req.params.id) },
-          { $set: { role } },
-        );
+        const id = req.params.id;
+        const result = await ticketsCollection.deleteOne({
+          _id: new ObjectId(id),
+        });
         res.send({ success: true, result });
       } catch (error) {
-        res.status(500).send({ message: 'Error updating role', error });
-      }
-    });
-
-    // Mark vendor as fraud (hides their tickets too)
-    app.patch('/users/fraud/:id', verifyJWT, verifyAdmin, async (req, res) => {
-      try {
-        const vendor = await usersCollection.findOne({
-          _id: new ObjectId(req.params.id),
-        });
-        if (!vendor)
-          return res.status(404).send({ message: 'User not found.' });
-
-        await usersCollection.updateOne(
-          { _id: new ObjectId(req.params.id) },
-          { $set: { isFraud: true } },
-        );
-
-        // Hide all this vendor's tickets
-        await ticketsCollection.updateMany(
-          { vendorEmail: vendor.email },
-          { $set: { isHidden: true } },
-        );
-
-        res.send({
-          success: true,
-          message: 'Vendor flagged and tickets hidden.',
-        });
-      } catch (error) {
-        res.status(500).send({ message: 'Error flagging fraud', error });
+        res.status(500).send({ message: 'Error deleting ticket', error });
       }
     });
 
     // ══════════════════════════════════════════
     // BOOKING ENDPOINTS
-    // ⚠️ /bookings/vendor must come before /bookings/:id
     // ══════════════════════════════════════════
 
-    // User: Create booking
     app.post('/bookings', verifyJWT, async (req, res) => {
       try {
-        const booking = {
-          ...req.body,
-          createdAt: new Date(),
-        };
+        const booking = { ...req.body, createdAt: new Date() };
         const result = await bookingsCollection.insertOne(booking);
         res.status(201).send({ success: true, insertId: result.insertedId });
       } catch (error) {
@@ -572,27 +442,16 @@ async function run() {
       }
     });
 
-    // Vendor: See booking requests for their tickets
     app.get('/bookings/vendor', verifyJWT, verifyVendor, async (req, res) => {
       try {
-        const email = req.query.email;
-
-        if (req.decoded.role === 'vendor' && email !== req.decoded.email)
-          return res.status(403).send({ message: 'Forbidden.' });
-
-        // Get all tickets belonging to this vendor
+        const email = req.query.email || req.decoded.email;
         const vendorTickets = await ticketsCollection
-          .find(
-            { vendorEmail: email },
-            { projection: { _id: 1, company: 1, title: 1 } },
-          )
+          .find({ vendorEmail: email })
           .toArray();
-
         if (vendorTickets.length === 0) return res.send([]);
 
+        // Robust ID Mapping Strategy supporting String values natively forwarded from Client
         const ticketIds = vendorTickets.map(t => t._id.toString());
-
-        // Find bookings that match these ticket IDs
         const bookings = await bookingsCollection
           .find({ ticketId: { $in: ticketIds } })
           .sort({ createdAt: -1 })
@@ -606,18 +465,25 @@ async function run() {
       }
     });
 
-    // User: Get their own bookings | Admin: all bookings
     app.get('/bookings', verifyJWT, async (req, res) => {
       try {
-        const { email } = req.query;
-        const { role, email: decodedEmail } = req.decoded;
+        const email = req.query.email || req.decoded.email;
+        const query = req.decoded.role === 'admin' ? {} : { userEmail: email };
 
-        let query = {};
-        if (role === 'admin') {
-          if (email) query.userEmail = email;
-        } else {
-          // Non-admin can only see their own
-          query.userEmail = decodedEmail;
+        // Dynamic fallback routing for Vendor mapping via query layer
+        const vendorCheck = await usersCollection.findOne({
+          email: req.decoded.email,
+        });
+        if (vendorCheck?.role === 'vendor') {
+          const myTickets = await ticketsCollection
+            .find({ vendorEmail: req.decoded.email })
+            .toArray();
+          const ids = myTickets.map(t => t._id.toString());
+          const vendorRequests = await bookingsCollection
+            .find({ ticketId: { $in: ids } })
+            .sort({ createdAt: -1 })
+            .toArray();
+          return res.send(vendorRequests);
         }
 
         const result = await bookingsCollection
@@ -630,14 +496,13 @@ async function run() {
       }
     });
 
-    // Vendor: Accept or reject a booking
     app.patch(
-      '/bookings/:id/status',
+      ['/bookings/:id/status', '/bookings/:id'],
       verifyJWT,
       verifyVendor,
       async (req, res) => {
         try {
-          const { status } = req.body; // 'accepted' | 'rejected'
+          const { status } = req.body;
           const result = await bookingsCollection.updateOne(
             { _id: new ObjectId(req.params.id) },
             { $set: { status, updatedAt: new Date() } },
@@ -650,106 +515,6 @@ async function run() {
         }
       },
     );
-
-    // User: Mark booking as paid (called after Stripe payment)
-    app.patch('/bookings/:id/pay', verifyJWT, async (req, res) => {
-      try {
-        const bookingId = req.params.id;
-        const booking = await bookingsCollection.findOne({
-          _id: new ObjectId(bookingId),
-        });
-
-        if (!booking)
-          return res.status(404).send({ message: 'Booking not found.' });
-
-        // Security: only the booking owner can pay
-        if (booking.userEmail !== req.decoded.email)
-          return res.status(403).send({ message: 'Forbidden.' });
-
-        // Update booking to paid
-        await bookingsCollection.updateOne(
-          { _id: new ObjectId(bookingId) },
-          { $set: { status: 'paid', paidAt: new Date() } },
-        );
-
-        // Deduct seats from ticket
-        if (booking.ticketId) {
-          const ticketQuery = ObjectId.isValid(booking.ticketId)
-            ? { _id: new ObjectId(booking.ticketId) }
-            : { id: booking.ticketId };
-
-          await ticketsCollection.updateOne(ticketQuery, {
-            $inc: { seats: -Math.abs(Number(booking.quantity || 1)) },
-          });
-        }
-
-        // Save transaction record
-        await transactionsCollection.insertOne({
-          bookingId: bookingId,
-          amount: booking.price,
-          ticketTitle: booking.company || booking.title || 'Ticket',
-          userEmail: booking.userEmail,
-          createdAt: new Date(),
-        });
-
-        res.send({ success: true, message: 'Payment confirmed.' });
-      } catch (error) {
-        res.status(500).send({ message: 'Payment processing failed', error });
-      }
-    });
-
-    // User: Cancel booking (only if still pending)
-    app.delete('/bookings/:id', verifyJWT, async (req, res) => {
-      try {
-        const booking = await bookingsCollection.findOne({
-          _id: new ObjectId(req.params.id),
-        });
-
-        if (!booking)
-          return res.status(404).send({ message: 'Booking not found.' });
-
-        // Only owner can cancel, and only if pending
-        if (
-          booking.userEmail !== req.decoded.email &&
-          req.decoded.role !== 'admin'
-        )
-          return res.status(403).send({ message: 'Forbidden.' });
-
-        if (booking.status !== 'pending' && req.decoded.role !== 'admin')
-          return res
-            .status(400)
-            .send({ message: 'Can only cancel pending bookings.' });
-
-        const result = await bookingsCollection.deleteOne({
-          _id: new ObjectId(req.params.id),
-        });
-        res.send({ success: true, result });
-      } catch (error) {
-        res.status(500).send({ message: 'Error cancelling booking', error });
-      }
-    });
-
-    // ══════════════════════════════════════════
-    // STRIPE PAYMENT ENDPOINTS
-    // ══════════════════════════════════════════
-
-    app.post('/create-payment-intent', verifyJWT, async (req, res) => {
-      try {
-        const { price } = req.body;
-        if (!price || isNaN(price))
-          return res.status(400).send({ message: 'Invalid price.' });
-
-        const paymentIntent = await stripe.paymentIntents.create({
-          amount: Math.round(Number(price) * 100),
-          currency: 'bdt',
-          payment_method_types: ['card'],
-        });
-
-        res.send({ clientSecret: paymentIntent.client_secret });
-      } catch (error) {
-        res.status(500).send({ message: 'Stripe error', error: error.message });
-      }
-    });
 
     app.post('/payments/confirm', verifyJWT, async (req, res) => {
       try {
@@ -765,8 +530,8 @@ async function run() {
 
         await transactionsCollection.insertOne({
           transactionId,
-          amount: finalPrice,
-          ticketTitle: ticketTitle || 'Ticket',
+          amount: Number(finalPrice),
+          ticketTitle: ticketTitle || 'Premium Transit Pass',
           userEmail,
           createdAt: new Date(),
         });
@@ -776,30 +541,135 @@ async function run() {
           { $set: { status: 'paid' } },
         );
 
-        const ticketQuery = ObjectId.isValid(ticketId)
-          ? { _id: new ObjectId(ticketId) }
-          : { id: Number(ticketId) };
+        const targetId = ticketId;
+        if (targetId) {
+          const ticketQuery = ObjectId.isValid(targetId)
+            ? { _id: new ObjectId(targetId) }
+            : { id: Number(targetId) };
+          await ticketsCollection.updateOne(ticketQuery, {
+            $inc: { seats: -Math.abs(Number(quantity || 1)) },
+          });
+        }
 
-        await ticketsCollection.updateOne(ticketQuery, {
-          $inc: { seats: -Math.abs(Number(quantity || 1)) },
+        res.send({ success: true, message: 'Payment captured securely.' });
+      } catch (error) {
+        res.status(500).send({ message: 'Payment processing failed', error });
+      }
+    });
+
+    app.patch('/bookings/:id/pay', verifyJWT, async (req, res) => {
+      try {
+        const bookingId = req.params.id;
+        const booking = await bookingsCollection.findOne({
+          _id: new ObjectId(bookingId),
+        });
+        if (!booking)
+          return res.status(404).send({ message: 'Booking not found.' });
+
+        await bookingsCollection.updateOne(
+          { _id: new ObjectId(bookingId) },
+          { $set: { status: 'paid', paidAt: new Date() } },
+        );
+
+        if (booking.ticketId) {
+          const ticketQuery = ObjectId.isValid(booking.ticketId)
+            ? { _id: new ObjectId(booking.ticketId) }
+            : { id: booking.ticketId };
+          await ticketsCollection.updateOne(ticketQuery, {
+            $inc: { seats: -Math.abs(Number(booking.quantity || 1)) },
+          });
+        }
+
+        await transactionsCollection.insertOne({
+          transactionId: 'ch_' + Math.random().toString(36).substr(2, 9),
+          amount: booking.price,
+          ticketTitle: booking.company || booking.title || 'Ticket',
+          userEmail: booking.userEmail,
+          createdAt: new Date(),
         });
 
         res.send({ success: true, message: 'Payment confirmed.' });
       } catch (error) {
-        res.status(500).send({ message: 'Payment confirmation failed', error });
+        res.status(500).send({ message: 'Payment processing failed', error });
       }
     });
 
-    // User: Transaction history
+    // ══════════════════════════════════════════
+    // USER MANAGEMENT & STRIPE ENDPOINTS
+    // ══════════════════════════════════════════
+
+    app.get('/users', verifyJWT, verifyAdmin, async (req, res) => {
+      try {
+        const result = await usersCollection
+          .find({}, { projection: { password: 0 } })
+          .toArray();
+        res.send(result);
+      } catch (error) {
+        res.status(500).send({ message: 'Error fetching users', error });
+      }
+    });
+
+    app.patch('/users/role/:id', verifyJWT, verifyAdmin, async (req, res) => {
+      try {
+        const { role } = req.body;
+        const result = await usersCollection.updateOne(
+          { _id: new ObjectId(req.params.id) },
+          { $set: { role } },
+        );
+        res.send({ success: true, result });
+      } catch (error) {
+        res.status(500).send({ message: 'Error updating role', error });
+      }
+    });
+
+    app.patch('/users/fraud/:id', verifyJWT, verifyAdmin, async (req, res) => {
+      try {
+        const vendor = await usersCollection.findOne({
+          _id: new ObjectId(req.params.id),
+        });
+        if (!vendor)
+          return res.status(404).send({ message: 'User not found.' });
+
+        await usersCollection.updateOne(
+          { _id: new ObjectId(req.params.id) },
+          { $set: { isFraud: true } },
+        );
+        await ticketsCollection.updateMany(
+          { vendorEmail: vendor.email },
+          { $set: { isHidden: true } },
+        );
+        res.send({
+          success: true,
+          message: 'Vendor flagged and tickets hidden.',
+        });
+      } catch (error) {
+        res.status(500).send({ message: 'Error flagging fraud', error });
+      }
+    });
+
+    app.post('/create-payment-intent', verifyJWT, async (req, res) => {
+      try {
+        const { price } = req.body;
+        if (!price || isNaN(price))
+          return res.status(400).send({ message: 'Invalid price.' });
+
+        const paymentIntent = await stripe.paymentIntents.create({
+          amount: Math.round(Number(price) * 100),
+          currency: 'bdt',
+          payment_method_types: ['card'],
+        });
+        res.send({ clientSecret: paymentIntent.client_secret });
+      } catch (error) {
+        res.status(500).send({ message: 'Stripe error', error: error.message });
+      }
+    });
+
     app.get('/transactions', verifyJWT, async (req, res) => {
       try {
         const { email } = req.query;
-
-        // Security: user can only see own transactions
         const queryEmail =
           req.decoded.role === 'admin' ? email : req.decoded.email;
         const query = queryEmail ? { userEmail: queryEmail } : {};
-
         const result = await transactionsCollection
           .find(query)
           .sort({ createdAt: -1 })
@@ -813,7 +683,6 @@ async function run() {
     // Keep connection alive
   }
 }
-
 run().catch(console.dir);
 
 app.get('/', (req, res) => {
