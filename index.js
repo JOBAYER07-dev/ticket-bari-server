@@ -10,10 +10,18 @@ const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
 const app = express();
 const port = process.env.PORT || 5000;
 
-app.use(cors());
+// ✅ FIX 1: CORS with allowed origins
+app.use(
+  cors({
+    origin: [
+      'https://ticket-bari-client-one.vercel.app',
+      'http://localhost:3000',
+    ],
+    credentials: true,
+  }),
+);
 app.use(express.json());
 
-// MongoDB Connection
 const client = new MongoClient(process.env.MONGODB_URI, {
   serverApi: {
     version: ServerApiVersion.v1,
@@ -22,11 +30,9 @@ const client = new MongoClient(process.env.MONGODB_URI, {
   },
 });
 
-// JWT Middleware
 function verifyJWT(req, res, next) {
   const authHeader = req.headers.authorization;
   if (!authHeader) return res.status(401).send({ message: 'Unauthorized!' });
-
   const token = authHeader.split(' ')[1];
   jwt.verify(token, process.env.JWT_SECRET, (err, decoded) => {
     if (err) return res.status(403).send({ message: 'Forbidden!' });
@@ -46,7 +52,6 @@ async function run() {
     const bookingsCollection = db.collection('bookings');
     const transactionsCollection = db.collection('transactions');
 
-    // Role Middlewares
     const verifyAdmin = async (req, res, next) => {
       const user = await usersCollection.findOne({ email: req.decoded.email });
       if (user?.role !== 'admin')
@@ -96,7 +101,6 @@ async function run() {
       try {
         const { email, password } = req.body;
         const user = await usersCollection.findOne({ email });
-
         if (!user) return res.status(404).send({ message: 'User not found!' });
         if (user.isFraud)
           return res.status(403).send({ message: 'Account flagged as fraud.' });
@@ -240,7 +244,6 @@ async function run() {
       }
     });
 
-    // Support both /tickets/all and /tickets/all configuration triggers for Frontend UI Compatibility
     app.get('/tickets/all', verifyJWT, verifyAdmin, async (req, res) => {
       try {
         const result = await ticketsCollection
@@ -283,7 +286,6 @@ async function run() {
           email,
         } = req.query;
 
-        // Route Compatibility: If vendor requests via /tickets?email=
         if (email) {
           const result = await ticketsCollection
             .find({ vendorEmail: email })
@@ -362,7 +364,30 @@ async function run() {
       }
     });
 
-    // Support dual endpoint parameter mapping for status patchers
+    // ✅ FIX 2: PATCH /tickets/:id — Ticket UPDATE route (was missing!)
+    app.patch('/tickets/:id', verifyJWT, verifyVendor, async (req, res) => {
+      try {
+        const id = req.params.id;
+        const updateData = { ...req.body };
+        delete updateData._id; // _id change করা যাবে না
+
+        const result = await ticketsCollection.updateOne(
+          { _id: new ObjectId(id) },
+          {
+            $set: {
+              ...updateData,
+              price: Number(updateData.price),
+              seats: Number(updateData.seats),
+              updatedAt: new Date(),
+            },
+          },
+        );
+        res.send({ success: true, result });
+      } catch (error) {
+        res.status(500).send({ message: 'Error updating ticket', error });
+      }
+    });
+
     app.patch(
       ['/tickets/:id/status', '/tickets/status/:id'],
       verifyJWT,
@@ -391,11 +416,9 @@ async function run() {
       async (req, res) => {
         try {
           const id = req.params.id;
-          const { advertised, advertiseState } = req.body;
-          const finalState =
-            advertised !== undefined ? advertised : advertiseState;
+          const { advertised } = req.body;
 
-          if (finalState === true) {
+          if (advertised === true) {
             const count = await ticketsCollection.countDocuments({
               advertised: true,
             });
@@ -407,7 +430,7 @@ async function run() {
 
           const result = await ticketsCollection.updateOne(
             { _id: new ObjectId(id) },
-            { $set: { advertised: finalState } },
+            { $set: { advertised } },
           );
           res.send({ success: true, result });
         } catch (error) {
@@ -418,9 +441,8 @@ async function run() {
 
     app.delete('/tickets/:id', verifyJWT, verifyVendor, async (req, res) => {
       try {
-        const id = req.params.id;
         const result = await ticketsCollection.deleteOne({
-          _id: new ObjectId(id),
+          _id: new ObjectId(req.params.id),
         });
         res.send({ success: true, result });
       } catch (error) {
@@ -450,7 +472,6 @@ async function run() {
           .toArray();
         if (vendorTickets.length === 0) return res.send([]);
 
-        // Robust ID Mapping Strategy supporting String values natively forwarded from Client
         const ticketIds = vendorTickets.map(t => t._id.toString());
         const bookings = await bookingsCollection
           .find({ ticketId: { $in: ticketIds } })
@@ -470,7 +491,6 @@ async function run() {
         const email = req.query.email || req.decoded.email;
         const query = req.decoded.role === 'admin' ? {} : { userEmail: email };
 
-        // Dynamic fallback routing for Vendor mapping via query layer
         const vendorCheck = await usersCollection.findOne({
           email: req.decoded.email,
         });
@@ -541,11 +561,10 @@ async function run() {
           { $set: { status: 'paid' } },
         );
 
-        const targetId = ticketId;
-        if (targetId) {
-          const ticketQuery = ObjectId.isValid(targetId)
-            ? { _id: new ObjectId(targetId) }
-            : { id: Number(targetId) };
+        if (ticketId) {
+          const ticketQuery = ObjectId.isValid(ticketId)
+            ? { _id: new ObjectId(ticketId) }
+            : { id: Number(ticketId) };
           await ticketsCollection.updateOne(ticketQuery, {
             $inc: { seats: -Math.abs(Number(quantity || 1)) },
           });
@@ -557,45 +576,69 @@ async function run() {
       }
     });
 
-    app.patch('/bookings/:id/pay', verifyJWT, async (req, res) => {
-      try {
-        const bookingId = req.params.id;
-        const booking = await bookingsCollection.findOne({
-          _id: new ObjectId(bookingId),
-        });
-        if (!booking)
-          return res.status(404).send({ message: 'Booking not found.' });
+    // ══════════════════════════════════════════
+    // ✅ FIX 3: REVENUE STATS ENDPOINT
+    // ══════════════════════════════════════════
 
-        await bookingsCollection.updateOne(
-          { _id: new ObjectId(bookingId) },
-          { $set: { status: 'paid', paidAt: new Date() } },
+    app.get('/revenue/stats', verifyJWT, verifyVendor, async (req, res) => {
+      try {
+        const email = req.decoded.email;
+        const myTickets = await ticketsCollection
+          .find({ vendorEmail: email })
+          .toArray();
+
+        const ticketIds = myTickets.map(t => t._id.toString());
+
+        const paidBookings = await bookingsCollection
+          .find({ ticketId: { $in: ticketIds }, status: 'paid' })
+          .toArray();
+
+        const totalRevenue = paidBookings.reduce(
+          (sum, b) => sum + (Number(b.price) || 0),
+          0,
+        );
+        const totalSold = paidBookings.reduce(
+          (sum, b) => sum + (Number(b.quantity) || 0),
+          0,
         );
 
-        if (booking.ticketId) {
-          const ticketQuery = ObjectId.isValid(booking.ticketId)
-            ? { _id: new ObjectId(booking.ticketId) }
-            : { id: booking.ticketId };
-          await ticketsCollection.updateOne(ticketQuery, {
-            $inc: { seats: -Math.abs(Number(booking.quantity || 1)) },
-          });
-        }
-
-        await transactionsCollection.insertOne({
-          transactionId: 'ch_' + Math.random().toString(36).substr(2, 9),
-          amount: booking.price,
-          ticketTitle: booking.company || booking.title || 'Ticket',
-          userEmail: booking.userEmail,
-          createdAt: new Date(),
+        // Breakdown by transport type
+        const byType = ['Bus', 'Train', 'Plane', 'Launch'].map(type => {
+          const typeTickets = myTickets.filter(t => t.type === type);
+          const typeIds = typeTickets.map(t => t._id.toString());
+          const typeBookings = paidBookings.filter(b =>
+            typeIds.includes(b.ticketId),
+          );
+          const typeRevenue = typeBookings.reduce(
+            (sum, b) => sum + (Number(b.price) || 0),
+            0,
+          );
+          return {
+            name: type,
+            tickets: typeTickets.length,
+            revenue: typeRevenue,
+            sold: typeBookings.reduce(
+              (sum, b) => sum + (Number(b.quantity) || 0),
+              0,
+            ),
+          };
         });
 
-        res.send({ success: true, message: 'Payment confirmed.' });
+        res.send({
+          totalTickets: myTickets.length,
+          totalSold,
+          totalRevenue,
+          byType,
+        });
       } catch (error) {
-        res.status(500).send({ message: 'Payment processing failed', error });
+        res
+          .status(500)
+          .send({ message: 'Error fetching revenue stats', error });
       }
     });
 
     // ══════════════════════════════════════════
-    // USER MANAGEMENT & STRIPE ENDPOINTS
+    // USER MANAGEMENT
     // ══════════════════════════════════════════
 
     app.get('/users', verifyJWT, verifyAdmin, async (req, res) => {
@@ -647,6 +690,7 @@ async function run() {
       }
     });
 
+    // ✅ FIX 4: Stripe USD currency (BDT supported না)
     app.post('/create-payment-intent', verifyJWT, async (req, res) => {
       try {
         const { price } = req.body;
@@ -655,7 +699,7 @@ async function run() {
 
         const paymentIntent = await stripe.paymentIntents.create({
           amount: Math.round(Number(price) * 100),
-          currency: 'bdt',
+          currency: 'usd', // ✅ Fixed: bdt → usd
           payment_method_types: ['card'],
         });
         res.send({ clientSecret: paymentIntent.client_secret });
@@ -680,7 +724,7 @@ async function run() {
       }
     });
   } finally {
-    // Keep connection alive
+    // keep alive
   }
 }
 run().catch(console.dir);
