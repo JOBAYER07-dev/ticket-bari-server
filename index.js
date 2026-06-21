@@ -41,6 +41,13 @@ function verifyJWT(req, res, next) {
   });
 }
 
+// ✅ Helper: check if a departure date/time has already passed
+function isDeparturePassed(date, time) {
+  if (!date) return false;
+  const target = new Date(`${date}T${time || '00:00'}`).getTime();
+  return Date.now() > target;
+}
+
 async function run() {
   try {
     await client.connect();
@@ -364,12 +371,29 @@ async function run() {
       }
     });
 
-    // ✅ FIX 2: PATCH /tickets/:id — Ticket UPDATE route (was missing!)
+    // ✅ FIX 2: PATCH /tickets/:id — Ticket UPDATE route + ownership check
     app.patch('/tickets/:id', verifyJWT, verifyVendor, async (req, res) => {
       try {
         const id = req.params.id;
+        const ticket = await ticketsCollection.findOne({
+          _id: new ObjectId(id),
+        });
+        if (!ticket)
+          return res.status(404).send({ message: 'Ticket not found.' });
+
+        // ✅ SECURITY FIX: only the owning vendor (or admin) can update this ticket
+        if (
+          req.decoded.role !== 'admin' &&
+          ticket.vendorEmail !== req.decoded.email
+        ) {
+          return res
+            .status(403)
+            .send({ message: 'You can only edit your own tickets.' });
+        }
+
         const updateData = { ...req.body };
         delete updateData._id; // _id change করা যাবে না
+        delete updateData.vendorEmail; // vendor change করতে পারবে না
 
         const result = await ticketsCollection.updateOne(
           { _id: new ObjectId(id) },
@@ -439,8 +463,25 @@ async function run() {
       },
     );
 
+    // ✅ DELETE /tickets/:id — ownership check added
     app.delete('/tickets/:id', verifyJWT, verifyVendor, async (req, res) => {
       try {
+        const ticket = await ticketsCollection.findOne({
+          _id: new ObjectId(req.params.id),
+        });
+        if (!ticket)
+          return res.status(404).send({ message: 'Ticket not found.' });
+
+        // ✅ SECURITY FIX: only the owning vendor (or admin) can delete this ticket
+        if (
+          req.decoded.role !== 'admin' &&
+          ticket.vendorEmail !== req.decoded.email
+        ) {
+          return res
+            .status(403)
+            .send({ message: 'You can only delete your own tickets.' });
+        }
+
         const result = await ticketsCollection.deleteOne({
           _id: new ObjectId(req.params.id),
         });
@@ -454,9 +495,55 @@ async function run() {
     // BOOKING ENDPOINTS
     // ══════════════════════════════════════════
 
+    // ✅ POST /bookings — server-side validation added
     app.post('/bookings', verifyJWT, async (req, res) => {
       try {
-        const booking = { ...req.body, createdAt: new Date() };
+        const { ticketId, quantity } = req.body;
+
+        if (!ticketId) {
+          return res.status(400).send({ message: 'ticketId is required.' });
+        }
+
+        const ticketQuery = ObjectId.isValid(ticketId)
+          ? { _id: new ObjectId(ticketId) }
+          : { id: Number(ticketId) };
+        const ticket = await ticketsCollection.findOne(ticketQuery);
+
+        if (!ticket) {
+          return res.status(404).send({ message: 'Ticket not found.' });
+        }
+        if (ticket.status !== 'approved' || ticket.isHidden) {
+          return res
+            .status(400)
+            .send({ message: 'This ticket is not available for booking.' });
+        }
+        if (!ticket.seats || ticket.seats <= 0) {
+          return res
+            .status(400)
+            .send({ message: 'No seats left for this ticket.' });
+        }
+        const qty = Number(quantity) || 0;
+        if (qty <= 0) {
+          return res.status(400).send({ message: 'Invalid booking quantity.' });
+        }
+        if (qty > ticket.seats) {
+          return res
+            .status(400)
+            .send({ message: 'Booking quantity exceeds available seats.' });
+        }
+        if (isDeparturePassed(ticket.date, ticket.time)) {
+          return res
+            .status(400)
+            .send({ message: 'Departure time has already passed.' });
+        }
+
+        const booking = {
+          ...req.body,
+          userEmail: req.decoded.email, // ✅ always trust the token, not client input
+          status: 'pending',
+          createdAt: new Date(),
+        };
+
         const result = await bookingsCollection.insertOne(booking);
         res.status(201).send({ success: true, insertId: result.insertedId });
       } catch (error) {
@@ -516,6 +603,7 @@ async function run() {
       }
     });
 
+    // ✅ PATCH /bookings/:id/status — ownership check added
     app.patch(
       ['/bookings/:id/status', '/bookings/:id'],
       verifyJWT,
@@ -523,6 +611,25 @@ async function run() {
       async (req, res) => {
         try {
           const { status } = req.body;
+          const booking = await bookingsCollection.findOne({
+            _id: new ObjectId(req.params.id),
+          });
+          if (!booking)
+            return res.status(404).send({ message: 'Booking not found.' });
+
+          // ✅ SECURITY FIX: vendor can only manage bookings on their own tickets
+          if (req.decoded.role !== 'admin') {
+            const ticketQuery = ObjectId.isValid(booking.ticketId)
+              ? { _id: new ObjectId(booking.ticketId) }
+              : { id: Number(booking.ticketId) };
+            const ticket = await ticketsCollection.findOne(ticketQuery);
+            if (!ticket || ticket.vendorEmail !== req.decoded.email) {
+              return res
+                .status(403)
+                .send({ message: 'You can only manage your own bookings.' });
+            }
+          }
+
           const result = await bookingsCollection.updateOne(
             { _id: new ObjectId(req.params.id) },
             { $set: { status, updatedAt: new Date() } },
@@ -536,6 +643,65 @@ async function run() {
       },
     );
 
+    // ✅ NEW: Cancel booking (optional requirement — only before vendor accepts)
+    app.delete('/bookings/:id', verifyJWT, async (req, res) => {
+      try {
+        const booking = await bookingsCollection.findOne({
+          _id: new ObjectId(req.params.id),
+        });
+        if (!booking)
+          return res.status(404).send({ message: 'Booking not found.' });
+
+        if (booking.userEmail !== req.decoded.email) {
+          return res
+            .status(403)
+            .send({ message: 'You can only cancel your own bookings.' });
+        }
+        if (booking.status !== 'pending') {
+          return res
+            .status(400)
+            .send({ message: 'Only pending bookings can be cancelled.' });
+        }
+
+        const result = await bookingsCollection.deleteOne({
+          _id: new ObjectId(req.params.id),
+        });
+        res.send({ success: true, result });
+      } catch (error) {
+        res.status(500).send({ message: 'Error cancelling booking', error });
+      }
+    });
+
+    // ✅ FIX: payment blocked if departure has already passed
+    app.post('/create-payment-intent', verifyJWT, async (req, res) => {
+      try {
+        const { price, ticketId } = req.body;
+        if (!price || isNaN(price))
+          return res.status(400).send({ message: 'Invalid price.' });
+
+        if (ticketId) {
+          const ticketQuery = ObjectId.isValid(ticketId)
+            ? { _id: new ObjectId(ticketId) }
+            : { id: Number(ticketId) };
+          const ticket = await ticketsCollection.findOne(ticketQuery);
+          if (ticket && isDeparturePassed(ticket.date, ticket.time)) {
+            return res
+              .status(400)
+              .send({ message: 'Cannot pay — departure time has passed.' });
+          }
+        }
+
+        const paymentIntent = await stripe.paymentIntents.create({
+          amount: Math.round(Number(price) * 100),
+          currency: 'usd', // ✅ Fixed: bdt → usd (Stripe doesn't support bdt directly)
+          payment_method_types: ['card'],
+        });
+        res.send({ clientSecret: paymentIntent.client_secret });
+      } catch (error) {
+        res.status(500).send({ message: 'Stripe error', error: error.message });
+      }
+    });
+
     app.post('/payments/confirm', verifyJWT, async (req, res) => {
       try {
         const {
@@ -547,6 +713,19 @@ async function run() {
           userEmail,
           quantity,
         } = req.body;
+
+        // ✅ Re-check departure time at confirm step too (defense in depth)
+        if (ticketId) {
+          const ticketQuery = ObjectId.isValid(ticketId)
+            ? { _id: new ObjectId(ticketId) }
+            : { id: Number(ticketId) };
+          const ticket = await ticketsCollection.findOne(ticketQuery);
+          if (ticket && isDeparturePassed(ticket.date, ticket.time)) {
+            return res
+              .status(400)
+              .send({ message: 'Cannot pay — departure time has passed.' });
+          }
+        }
 
         await transactionsCollection.insertOne({
           transactionId,
@@ -577,7 +756,7 @@ async function run() {
     });
 
     // ══════════════════════════════════════════
-    // ✅ FIX 3: REVENUE STATS ENDPOINT
+    // REVENUE STATS ENDPOINT
     // ══════════════════════════════════════════
 
     app.get('/revenue/stats', verifyJWT, verifyVendor, async (req, res) => {
@@ -687,24 +866,6 @@ async function run() {
         });
       } catch (error) {
         res.status(500).send({ message: 'Error flagging fraud', error });
-      }
-    });
-
-    // ✅ FIX 4: Stripe USD currency (BDT supported না)
-    app.post('/create-payment-intent', verifyJWT, async (req, res) => {
-      try {
-        const { price } = req.body;
-        if (!price || isNaN(price))
-          return res.status(400).send({ message: 'Invalid price.' });
-
-        const paymentIntent = await stripe.paymentIntents.create({
-          amount: Math.round(Number(price) * 100),
-          currency: 'usd', // ✅ Fixed: bdt → usd
-          payment_method_types: ['card'],
-        });
-        res.send({ clientSecret: paymentIntent.client_secret });
-      } catch (error) {
-        res.status(500).send({ message: 'Stripe error', error: error.message });
       }
     });
 
