@@ -562,7 +562,7 @@ async function run() {
 
     app.get('/bookings', verifyJWT, async (req, res) => {
       try {
-        const email = req.query.email || req.decoded.email;
+        const email = req.decoded.email;
         const query = req.decoded.role === 'admin' ? {} : { userEmail: email };
 
         const vendorCheck = await usersCollection.findOne({
