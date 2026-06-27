@@ -263,10 +263,7 @@ async function run() {
 
     app.get('/tickets/vendor', verifyJWT, verifyVendor, async (req, res) => {
       try {
-        const email = req.query.email || req.decoded.email;
-        if (req.decoded.role === 'vendor' && email !== req.decoded.email) {
-          return res.status(403).send({ message: 'Forbidden.' });
-        }
+        const email = req.decoded.email;
         const result = await ticketsCollection
           .find({ vendorEmail: email })
           .sort({ createdAt: -1 })
@@ -492,7 +489,6 @@ async function run() {
     app.post('/bookings', verifyJWT, async (req, res) => {
       try {
         const { ticketId, quantity } = req.body;
-
         if (!ticketId)
           return res.status(400).send({ message: 'ticketId is required.' });
 
@@ -540,7 +536,7 @@ async function run() {
 
     app.get('/bookings/vendor', verifyJWT, verifyVendor, async (req, res) => {
       try {
-        const email = req.query.email || req.decoded.email;
+        const email = req.decoded.email;
         const vendorTickets = await ticketsCollection
           .find({ vendorEmail: email })
           .toArray();
@@ -658,12 +654,10 @@ async function run() {
     // PAYMENT ENDPOINTS
     // ══════════════════════════════════════════
 
-    // ✅ NEW: Stripe Checkout Session
     app.post('/create-checkout-session', verifyJWT, async (req, res) => {
       try {
         const { price, ticketTitle, quantity, bookingId, ticketId } = req.body;
 
-        // departure check
         if (ticketId) {
           const ticketQuery = ObjectId.isValid(ticketId)
             ? { _id: new ObjectId(ticketId) }
@@ -867,14 +861,25 @@ async function run() {
       }
     });
 
+    // ✅ FIXED — role change হলে নতুন token issue করো
     app.patch('/users/role/:id', verifyJWT, verifyAdmin, async (req, res) => {
       try {
         const { role } = req.body;
-        const result = await usersCollection.updateOne(
+        await usersCollection.updateOne(
           { _id: new ObjectId(req.params.id) },
           { $set: { role } },
         );
-        res.send({ success: true, result });
+
+        const updatedUser = await usersCollection.findOne({
+          _id: new ObjectId(req.params.id),
+        });
+        const newToken = jwt.sign(
+          { email: updatedUser.email, role: updatedUser.role },
+          process.env.JWT_SECRET,
+          { expiresIn: '7d' },
+        );
+
+        res.send({ success: true, newToken });
       } catch (error) {
         res.status(500).send({ message: 'Error updating role', error });
       }
@@ -907,9 +912,8 @@ async function run() {
 
     app.get('/transactions', verifyJWT, async (req, res) => {
       try {
-        const { email } = req.query;
         const queryEmail =
-          req.decoded.role === 'admin' ? email : req.decoded.email;
+          req.decoded.role === 'admin' ? req.query.email : req.decoded.email;
         const query = queryEmail ? { userEmail: queryEmail } : {};
         const result = await transactionsCollection
           .find(query)
